@@ -31,8 +31,9 @@ type mmdbCode struct {
 
 // maxmindRecord matches MaxMind's nested schema (GeoLite2-Country).
 type maxmindRecord struct {
-	Country   mmdbCode `maxminddb:"country"`
-	Continent mmdbCode `maxminddb:"continent"`
+	Country           mmdbCode `maxminddb:"country"`
+	RegisteredCountry mmdbCode `maxminddb:"registered_country"`
+	Continent         mmdbCode `maxminddb:"continent"`
 }
 
 type overrideEntry struct {
@@ -85,7 +86,8 @@ func parseOverrides(raw string) []overrideEntry {
 // Lookup returns the lowercase ISO country code for ip.
 //
 // Precedence: GEOIP_OVERRIDES (operator-managed CIDR table, wins over the
-// database) -> ipinfo flat schema -> MaxMind nested schema -> continent.
+// database) -> ipinfo flat schema -> MaxMind country -> MaxMind registered
+// country -> continent.
 func Lookup(ip net.IP) (string, error) {
 	if ip == nil {
 		return "", errors.New("nil IP")
@@ -110,6 +112,12 @@ func Lookup(ip net.IP) (string, error) {
 	var nested maxmindRecord
 	if err := reader.Lookup(ip, &nested); err == nil && nested.Country.ISOCode != "" {
 		return strings.ToLower(nested.Country.ISOCode), nil
+	}
+
+	// Some anycast ranges (e.g. 1.1.1.1) carry only registered_country in
+	// GeoLite2; without this fallback those servers would show no flag at all.
+	if err := reader.Lookup(ip, &nested); err == nil && nested.RegisteredCountry.ISOCode != "" {
+		return strings.ToLower(nested.RegisteredCountry.ISOCode), nil
 	}
 
 	if flat.Continent != "" {
