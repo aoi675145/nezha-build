@@ -76,11 +76,19 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
+          # The panel uses go-sqlite3, which needs cgo. CGO_ENABLED=0 produces a
+          # binary whose sqlite is a stub: it prints "requires cgo to work" and
+          # the panel never boots. Link statically so the alpine base still runs it.
           mkdir -p ../dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=x86_64-linux-gnu-gcc \
             go build -trimpath -buildvcs=false -tags go_json \
-            -ldflags "-s -w -X github.com/nezhahq/nezha/service/singleton.Version=${DASHBOARD_VERSION#v}" \
+            -ldflags "-s -w -X github.com/nezhahq/nezha/service/singleton.Version=${DASHBOARD_VERSION#v} -extldflags '-static -fpic'" \
             -o ../dist/dashboard-linux-amd64 ./cmd/dashboard
+          file ../dist/dashboard-linux-amd64
+          ldd ../dist/dashboard-linux-amd64 2>&1 || true
+          if ldd ../dist/dashboard-linux-amd64 2>/dev/null | grep -q "=>"; then
+            echo "::error::binary is not statically linked"; exit 1
+          fi
           cd ../dist && zip -q dashboard-linux-amd64.zip dashboard-linux-amd64
           ls -l
 
