@@ -1,0 +1,105 @@
+name: Build dashboard (fresh GeoIP)
+
+# Builds Nezha v2.2.10 **unpatched** (no fork changes) and only swaps the GeoIP
+# country database for a current one. Publishes dashboard-linux-amd64.zip to the
+# release `v2.2.10`, which is what the panel container downloads on boot.
+#
+# Why this exists: the country flag in the panel comes from a database compiled
+# into the binary (go:embed). The official v2.2.10 build froze that database at
+# 2026-07, so flags drift from reality. Refresh = run this workflow, then
+# restart the panel instance. No image rebuild, no code changes.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  DASHBOARD_VERSION: v2.2.10
+  # MaxMind GeoLite2-Country, mirrored and refreshed by P3TERX (no token needed).
+  GEOIP_URL: https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          go install github.com/swaggo/swag/cmd/swag@v1.16.6
+
+      - name: Fetch sources
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$DASHBOARD_VERSION" https://github.com/nezhahq/nezha.git src
+
+      - name: Swap GeoIP database
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors -o src/pkg/geoip/geoip.db "$GEOIP_URL"
+          ls -l src/pkg/geoip/geoip.db
+          python3 - <<'PY'
+          import pathlib
+          data = pathlib.Path("src/pkg/geoip/geoip.db").read_bytes()
+          assert len(data) > 100_000, f"database too small: {len(data)}"
+          assert b"\xab\xcd\xefMaxMind.com" in data[-131072:], "not a MaxMind database"
+          print(f"GeoIP database ok: {len(data)} bytes")
+          PY
+          # GeoLite2 uses MaxMind's nested schema; upstream only reads ipinfo's flat one.
+          cp patches/geoip.go src/pkg/geoip/geoip.go
+          cp patches/geoip_lookup_test.go src/pkg/geoip/geoip_lookup_test.go
+
+      - name: "Verify lookups (real output)"
+        working-directory: src
+        run: go test -count=1 -v -run 'TestLookup$|TestParseOverrides$' ./pkg/geoip
+
+      - name: Prepare frontends and swagger docs
+        working-directory: src
+        run: |
+          set -euo pipefail
+          chmod +x ./script/fetch-frontends.sh && ./script/fetch-frontends.sh
+          "$(go env GOPATH)/bin/swag" init --pd -d cmd/dashboard -g main.go -o cmd/dashboard/docs
+
+      - name: Build
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -buildvcs=false -tags go_json \
+            -ldflags "-s -w -X github.com/nezhahq/nezha/service/singleton.Version=${DASHBOARD_VERSION#v}" \
+            -o ../dist/dashboard-linux-amd64 ./cmd/dashboard
+          cd ../dist && zip -q dashboard-linux-amd64.zip dashboard-linux-amd64
+          ls -l
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$DASHBOARD_VERSION"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" \
+              --title "Nezha Dashboard $tag (fresh GeoIP)" \
+              --notes "Unpatched Nezha $tag built with a current GeoLite2-Country database."
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$tag" dist/dashboard-linux-amd64.zip --clobber; then
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          echo "asset upload failed" >&2
+          exit 1
